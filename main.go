@@ -536,6 +536,28 @@ func scanPath(path string, threshold float64, scanGit bool) (*ScanResult, error)
 		}()
 	}
 
+	// Drain resultsChan concurrently with the walk and workers so the channel
+	// never fills up and blocks workers (which would in turn block the walk).
+	collectorDone := make(chan struct{})
+	go func() {
+		defer close(collectorDone)
+		for output := range resultsChan {
+			if output.file != nil {
+				result.TotalFiles++
+				if output.file.Sketchy {
+					result.SketchyFiles++
+					result.Files = append(result.Files, *output.file)
+				} else {
+					result.CleanFiles++
+				}
+			}
+			if output.skipped != nil {
+				result.SkippedFiles++
+				result.Skipped = append(result.Skipped, *output.skipped)
+			}
+		}
+	}()
+
 	// Walk the directory and send files to the workers.
 	walkErr := filepath.Walk(path, func(filePath string, info os.FileInfo, err error) error {
 		if err != nil {
@@ -557,27 +579,9 @@ func scanPath(path string, threshold float64, scanGit bool) (*ScanResult, error)
 	})
 
 	close(filesChan)
-
-	go func() {
-		wg.Wait()
-		close(resultsChan)
-	}()
-
-	for output := range resultsChan {
-		if output.file != nil {
-			result.TotalFiles++
-			if output.file.Sketchy {
-				result.SketchyFiles++
-				result.Files = append(result.Files, *output.file)
-			} else {
-				result.CleanFiles++
-			}
-		}
-		if output.skipped != nil {
-			result.SkippedFiles++
-			result.Skipped = append(result.Skipped, *output.skipped)
-		}
-	}
+	wg.Wait()
+	close(resultsChan)
+	<-collectorDone
 
 	close(progressDone)
 	fmt.Fprintf(os.Stderr, "\rScanning complete: %d files processed, %d files skipped\n\n", processedFiles.Load(), skippedFiles.Load())
